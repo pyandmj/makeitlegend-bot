@@ -255,27 +255,19 @@ function startPollingFallback(manusTaskId: string, department: string, channelId
       ? 'Task completed but no text output was returned.'
       : taskDetail.error || 'Task failed without details.');
 
-    // Build result embed
-    const resultEmbed = new EmbedBuilder()
-      .setColor(taskDetail.status === 'completed' ? BRAND_COLORS.success : BRAND_COLORS.danger)
-      .setTitle(taskDetail.status === 'completed' ? '✅ Task Completed' : '❌ Task Failed')
-      .setDescription(outputText.slice(0, 4000))
-      .addFields(
-        { name: 'Manus Task', value: `\`${manusTaskId}\``, inline: true },
-        { name: 'Department', value: department.charAt(0).toUpperCase() + department.slice(1), inline: true },
-        { name: 'Status', value: taskDetail.status, inline: true },
-      )
-      .setFooter({ text: '🐾 Make It Legend — Result via polling' })
-      .setTimestamp();
+    // Build plain text message
+    const statusIcon = taskDetail.status === 'completed' ? '✅' : '❌';
+    let message = `${statusIcon} **Task ${taskDetail.status === 'completed' ? 'Completed' : 'Failed'}**\n\n`;
+    message += outputText.slice(0, 1800);
 
     // If there are file attachments, add them
     if (extracted.files.length > 0) {
-      const fileList = extracted.files.map(f => `[📄 ${f.fileName}](${f.fileUrl})`).join('\n');
-      resultEmbed.addFields({ name: 'Attachments', value: fileList.slice(0, 1024) });
+      message += '\n\n📎 **Attachments:**\n';
+      message += extracted.files.map(f => `• ${f.fileName}: ${f.fileUrl}`).join('\n');
     }
 
-    // Post to the department channel
-    await router.routeDepartmentUpdate(department, resultEmbed);
+    // Post to the department channel as the department director
+    await router.sendAsDepartmentDirector(department, message);
 
     logger.info(`Posted polling result for ${manusTaskId} to ${department}`);
   }).catch(err => {
