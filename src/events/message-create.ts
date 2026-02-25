@@ -4,6 +4,7 @@ import { createModuleLogger } from '../utils/logger';
 import { getChannelRouter, getManusClient } from '../services/service-registry';
 import OpenAI from 'openai';
 import https from 'https';
+import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -11,22 +12,22 @@ import os from 'os';
 const logger = createModuleLogger('event:message');
 
 // Conversation history for Prime (keeps last 20 messages for context)
-const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+const conversationHistory: Array<{ role: string; parts: Array<{ text: string }> }> = [];
 const MAX_HISTORY = 20;
 
-// OpenAI client for LLM responses and transcription
-let openaiClient: OpenAI | null = null;
+// OpenAI client for Whisper transcription only
+let whisperClient: OpenAI | null = null;
 
-function getOpenAI(): OpenAI | null {
-  if (!openaiClient) {
+function getWhisperClient(): OpenAI | null {
+  if (!whisperClient) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      logger.warn('OPENAI_API_KEY not set — Prime cannot respond to messages');
+      logger.warn('OPENAI_API_KEY not set — voice memo transcription unavailable');
       return null;
     }
-    openaiClient = new OpenAI();
+    whisperClient = new OpenAI();
   }
-  return openaiClient;
+  return whisperClient;
 }
 
 // Prime's system prompt
@@ -59,7 +60,148 @@ Current business context:
 - Portrait generation uses a two-step process (LLM describes the pet, then AI generates painting from text)
 - Three portrait styles: Royal General, Space Explorer, Superhero
 - Stripe integration needs to be wired up for real payments
-- The team just set up this Discord command center today`;
+- The team just set up this Discord command center today
+- Discord bot runs on Railway at web-production-2dac0.up.railway.app`;
+
+/**
+ * Calls Google Gemini 3.1 Pro API directly.
+ */
+async function callGemini(userMessage: string): Promise<string> {
+  const apiKey = process.env.GOOGLE_AI_API_KEY;
+  if (!apiKey) {
+    return "My brain isn't connected yet. The Founder needs to add GOOGLE_AI_API_KEY to Railway environment variables.";
+  }
+
+  // Add user message to history
+  conversationHistory.push({ role: 'user', parts: [{ text: userMessage }] });
+
+  // Trim history if too long
+  while (conversationHistory.length > MAX_HISTORY) {
+    conversationHistory.shift();
+  }
+
+  const requestBody = JSON.stringify({
+    system_instruction: {
+      parts: [{ text: PRIME_SYSTEM_PROMPT }]
+    },
+    contents: conversationHistory,
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 1500,
+    }
+  });
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=${apiKey}`;
+
+  return new Promise((resolve) => {
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(requestBody),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          
+          if (parsed.error) {
+            logger.error('Gemini API error', { error: parsed.error });
+            // Try fallback model
+            conversationHistory.pop(); // Remove the user message we just added
+            return resolve(callGeminiFallback(userMessage));
+          }
+
+          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (text) {
+            conversationHistory.push({ role: 'model', parts: [{ text }] });
+            resolve(text);
+          } else {
+            logger.error('No text in Gemini response', { response: data.substring(0, 500) });
+            conversationHistory.pop();
+            resolve(callGeminiFallback(userMessage));
+          }
+        } catch (e: any) {
+          logger.error('Failed to parse Gemini response', { error: e?.message, data: data.substring(0, 500) });
+          conversationHistory.pop();
+          resolve(callGeminiFallback(userMessage));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      logger.error('Gemini request failed', { error: error.message });
+      conversationHistory.pop();
+      resolve(callGeminiFallback(userMessage));
+    });
+
+    req.setTimeout(30000, () => {
+      req.destroy();
+      logger.error('Gemini request timed out');
+      conversationHistory.pop();
+      resolve(callGeminiFallback(userMessage));
+    });
+
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+/**
+ * Fallback to Gemini 2.5 Flash via Manus OpenAI-compatible API.
+ */
+async function callGeminiFallback(userMessage: string): Promise<string> {
+  logger.info('Falling back to Gemini 2.5 Flash via OpenAI-compatible API');
+  
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return "Both my primary and fallback brains are offline. Need either GOOGLE_AI_API_KEY or OPENAI_API_KEY in Railway.";
+  }
+
+  const client = new OpenAI();
+  
+  // Convert history format for OpenAI
+  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    { role: 'system', content: PRIME_SYSTEM_PROMPT },
+  ];
+  
+  for (const msg of conversationHistory) {
+    messages.push({
+      role: msg.role === 'model' ? 'assistant' : 'user',
+      content: msg.parts[0]?.text || '',
+    });
+  }
+  
+  // Add the current message
+  messages.push({ role: 'user', content: userMessage });
+
+  try {
+    const response = await client.chat.completions.create({
+      model: 'gemini-2.5-flash',
+      messages,
+      max_tokens: 1500,
+      temperature: 0.7,
+    });
+
+    const reply = response.choices[0]?.message?.content || "Sorry, couldn't process that.";
+    
+    // Add to history in Gemini format
+    conversationHistory.push({ role: 'user', parts: [{ text: userMessage }] });
+    conversationHistory.push({ role: 'model', parts: [{ text: reply }] });
+    
+    return reply;
+  } catch (error: any) {
+    logger.error('Fallback LLM also failed', { error: error?.message });
+    return "Something went wrong on my end. Let me try again in a moment.";
+  }
+}
 
 /**
  * Downloads a file from a URL to a temporary path.
@@ -68,7 +210,6 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
     https.get(url, (response) => {
-      // Handle redirects
       if (response.statusCode === 301 || response.statusCode === 302) {
         const redirectUrl = response.headers.location;
         if (redirectUrl) {
@@ -92,8 +233,8 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
  * Transcribes a voice memo attachment using OpenAI Whisper.
  */
 async function transcribeVoiceMemo(attachment: Attachment): Promise<string | null> {
-  const openai = getOpenAI();
-  if (!openai) return null;
+  const whisper = getWhisperClient();
+  if (!whisper) return null;
 
   const tmpDir = os.tmpdir();
   const ext = path.extname(attachment.name || '.ogg') || '.ogg';
@@ -104,7 +245,7 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
     await downloadFile(attachment.url, tmpPath);
 
     logger.info('Transcribing voice memo with Whisper...');
-    const transcription = await openai.audio.transcriptions.create({
+    const transcription = await whisper.audio.transcriptions.create({
       file: fs.createReadStream(tmpPath),
       model: 'whisper-1',
     });
@@ -115,48 +256,7 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
     logger.error('Failed to transcribe voice memo', { error: error?.message || error });
     return null;
   } finally {
-    // Clean up temp file
     try { fs.unlinkSync(tmpPath); } catch {}
-  }
-}
-
-/**
- * Gets Prime's response using LLM.
- */
-async function getPrimeResponse(userMessage: string): Promise<string> {
-  const openai = getOpenAI();
-  if (!openai) {
-    return "I can't respond right now — my AI brain isn't connected. The Founder needs to add the OPENAI_API_KEY to Railway environment variables.";
-  }
-
-  // Add user message to history
-  conversationHistory.push({ role: 'user', content: userMessage });
-  
-  // Trim history if too long
-  while (conversationHistory.length > MAX_HISTORY) {
-    conversationHistory.shift();
-  }
-
-  try {
-    const response = await openai.chat.completions.create({
-      model: 'gemini-2.5-flash',
-      messages: [
-        { role: 'system', content: PRIME_SYSTEM_PROMPT },
-        ...conversationHistory,
-      ],
-      max_tokens: 1000,
-      temperature: 0.7,
-    });
-
-    const reply = response.choices[0]?.message?.content || "Sorry, I couldn't process that. Try again?";
-    
-    // Add assistant reply to history
-    conversationHistory.push({ role: 'assistant', content: reply });
-    
-    return reply;
-  } catch (error: any) {
-    logger.error('Failed to get Prime response', { error: error?.message || error });
-    return "Something went wrong on my end. Let me try again in a moment.";
   }
 }
 
@@ -191,14 +291,12 @@ export async function handleMessageCreate(message: Message): Promise<void> {
   );
 
   if (voiceAttachment) {
-    // Show typing indicator
     try { await (message.channel as any).sendTyping(); } catch {}
 
     const transcription = await transcribeVoiceMemo(voiceAttachment);
     if (transcription) {
       userText = transcription;
       
-      // Post the transcription so the Founder can see what was understood
       const router = getChannelRouter();
       if (router) {
         await router.sendAsAgent('ceo-briefing', 'manus-prime', `Got your voice memo. Here's what I heard:\n\n"${transcription}"`);
@@ -212,19 +310,15 @@ export async function handleMessageCreate(message: Message): Promise<void> {
     }
   }
 
-  // If no text content at all, ignore
   if (!userText.trim()) return;
 
-  // Show typing indicator
   try { await (message.channel as any).sendTyping(); } catch {}
 
-  // Get Prime's response
-  const response = await getPrimeResponse(userText);
+  // Get Prime's response using Gemini 3.1 Pro
+  const response = await callGemini(userText);
 
-  // Send response as Prime via webhook
   const router = getChannelRouter();
   if (router) {
-    // Split long responses into chunks (Discord 2000 char limit)
     if (response.length <= 2000) {
       await router.sendAsAgent('ceo-briefing', 'manus-prime', response);
     } else {
@@ -234,7 +328,6 @@ export async function handleMessageCreate(message: Message): Promise<void> {
       }
     }
   } else {
-    // Fallback: reply directly
     await message.reply(response);
   }
 }
