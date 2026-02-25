@@ -2,7 +2,6 @@ import { Message, Attachment } from 'discord.js';
 import { config } from '../config';
 import { createModuleLogger } from '../utils/logger';
 import { getChannelRouter, getManusClient } from '../services/service-registry';
-import OpenAI from 'openai';
 import https from 'https';
 import fs from 'fs';
 import path from 'path';
@@ -12,21 +11,6 @@ const logger = createModuleLogger('event:message');
 
 // Track the active Manus task ID for multi-turn conversation continuity
 let activeManusTaskId: string | null = null;
-
-// OpenAI client for Whisper transcription only
-let whisperClient: OpenAI | null = null;
-
-function getWhisperClient(): OpenAI | null {
-  if (!whisperClient) {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      logger.warn('OPENAI_API_KEY not set — voice memo transcription unavailable');
-      return null;
-    }
-    whisperClient = new OpenAI();
-  }
-  return whisperClient;
-}
 
 // Prime's system context — prepended to the first message in each Manus task
 const PRIME_CONTEXT = `You are Prime, the AI coordinator for Make It Legend — an AI pet portrait business. You are the brain of the operation, managing a team of AI directors:
@@ -87,7 +71,6 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
         if (taskDetail) {
           const extracted = manusClient.extractTaskOutput(taskDetail);
           if (extracted.text) {
-            // Update active task ID in case it changed
             activeManusTaskId = continueResult.task_id;
             return extracted.text;
           }
@@ -103,7 +86,7 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
     const enrichedPrompt = `${PRIME_CONTEXT}\n\n---\n\nThe Founder says: ${userMessage}`;
     
     const result = await manusClient.createTask({
-      department: 'engineering', // Prime is cross-department but needs a department for routing
+      department: 'engineering',
       agent: 'prime',
       operation: 'prime:conversation',
       request: {
@@ -125,7 +108,7 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
     // Poll for the response
     const taskDetail = await manusClient.pollTaskUntilDone(manusTaskId, {
       intervalMs: 3_000,
-      timeoutMs: 120_000, // 2 minutes max
+      timeoutMs: 120_000,
     });
 
     if (!taskDetail) {
@@ -136,7 +119,6 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
     const extracted = manusClient.extractTaskOutput(taskDetail);
     
     if (extracted.text) {
-      // Save the task ID for multi-turn continuation
       activeManusTaskId = manusTaskId;
       return extracted.text;
     }
@@ -176,11 +158,15 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
 }
 
 /**
- * Transcribes a voice memo attachment using OpenAI Whisper.
+ * Transcribes a voice memo using Google Gemini API.
+ * Uploads the audio as base64 inline data and asks Gemini to transcribe it.
  */
 async function transcribeVoiceMemo(attachment: Attachment): Promise<string | null> {
-  const whisper = getWhisperClient();
-  if (!whisper) return null;
+  const apiKey = process.env.GOOGLE_AI_API_KEY;
+  if (!apiKey) {
+    logger.warn('GOOGLE_AI_API_KEY not set — voice memo transcription unavailable');
+    return null;
+  }
 
   const tmpDir = os.tmpdir();
   const ext = path.extname(attachment.name || '.ogg') || '.ogg';
@@ -190,14 +176,105 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
     logger.info(`Downloading voice memo: ${attachment.name} (${attachment.size} bytes)`);
     await downloadFile(attachment.url, tmpPath);
 
-    logger.info('Transcribing voice memo with Whisper...');
-    const transcription = await whisper.audio.transcriptions.create({
-      file: fs.createReadStream(tmpPath),
-      model: 'whisper-1',
+    // Read the audio file and convert to base64
+    const audioBuffer = fs.readFileSync(tmpPath);
+    const audioBase64 = audioBuffer.toString('base64');
+
+    // Map file extension to MIME type
+    const mimeMap: Record<string, string> = {
+      '.ogg': 'audio/ogg',
+      '.mp3': 'audio/mp3',
+      '.wav': 'audio/wav',
+      '.m4a': 'audio/mp4',
+      '.webm': 'audio/webm',
+      '.opus': 'audio/ogg',
+    };
+    const mimeType = mimeMap[ext.toLowerCase()] || 'audio/ogg';
+
+    logger.info(`Transcribing voice memo with Gemini (${mimeType}, ${audioBuffer.length} bytes)...`);
+
+    // Call Gemini API with audio inline data
+    const requestBody = JSON.stringify({
+      contents: [{
+        parts: [
+          {
+            inline_data: {
+              mime_type: mimeType,
+              data: audioBase64,
+            }
+          },
+          {
+            text: 'Transcribe this audio message exactly as spoken. Return ONLY the transcription text, nothing else. No labels, no quotes, no explanations.'
+          }
+        ]
+      }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 2000,
+      }
     });
 
-    logger.info(`Transcription complete: ${transcription.text.substring(0, 100)}...`);
-    return transcription.text;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+
+    const transcription = await new Promise<string | null>((resolve) => {
+      const urlObj = new URL(url);
+      const options = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(requestBody),
+        },
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            
+            if (parsed.error) {
+              logger.error('Gemini transcription API error', { error: parsed.error });
+              resolve(null);
+              return;
+            }
+
+            const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (text) {
+              resolve(text.trim());
+            } else {
+              logger.error('No text in Gemini transcription response', { response: data.substring(0, 500) });
+              resolve(null);
+            }
+          } catch (e: any) {
+            logger.error('Failed to parse Gemini transcription response', { error: e?.message });
+            resolve(null);
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        logger.error('Gemini transcription request failed', { error: error.message });
+        resolve(null);
+      });
+
+      req.setTimeout(30000, () => {
+        req.destroy();
+        logger.error('Gemini transcription request timed out');
+        resolve(null);
+      });
+
+      req.write(requestBody);
+      req.end();
+    });
+
+    if (transcription) {
+      logger.info(`Transcription complete: ${transcription.substring(0, 100)}...`);
+    }
+    return transcription;
+
   } catch (error: any) {
     logger.error('Failed to transcribe voice memo', { error: error?.message || error });
     return null;
@@ -210,6 +287,7 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
  * Handles incoming messages in the ceo-briefing channel.
  * Prime responds to the Founder's messages (text and voice memos).
  * Uses Manus AI as the brain — same as all other directors.
+ * Voice transcription uses Google Gemini API.
  */
 export async function handleMessageCreate(message: Message): Promise<void> {
   // Ignore bot messages (including our own webhook messages)
