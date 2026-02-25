@@ -7,6 +7,7 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { pipeline } from 'stream/promises';
 
 const logger = createModuleLogger('event:message');
 
@@ -222,9 +223,9 @@ function findVoiceAttachment(message: Message): Attachment | null {
  * Uploads the audio as base64 inline data and asks Gemini to transcribe it.
  */
 async function transcribeVoiceMemo(attachment: Attachment): Promise<string | null> {
-  const apiKey = process.env.GOOGLE_AI_API_KEY;
+  const apiKey = config.googleAi.apiKey || process.env.GOOGLE_AI_API_KEY;
   if (!apiKey) {
-    logger.error('GOOGLE_AI_API_KEY not set — voice memo transcription unavailable');
+    logger.error('GOOGLE_AI_API_KEY not set — voice memo transcription unavailable. Set it in Railway environment variables.');
     return null;
   }
 
@@ -239,8 +240,10 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
   const tmpPath = path.join(tmpDir, `voice_${Date.now()}${ext}`);
 
   try {
-    logger.info(`Downloading voice memo: name=${attachment.name}, contentType=${attachment.contentType}, size=${attachment.size}, url=${attachment.url.substring(0, 100)}`);
-    await downloadFile(attachment.url, tmpPath);
+    // Use proxyURL first (more reliable, doesn't expire as fast), fall back to url
+    const downloadUrl = attachment.proxyURL || attachment.url;
+    logger.info(`Downloading voice memo: name=${attachment.name}, contentType=${attachment.contentType}, size=${attachment.size}, url=${downloadUrl.substring(0, 120)}`);
+    await downloadFile(downloadUrl, tmpPath);
 
     // Verify file was downloaded
     const stats = fs.statSync(tmpPath);

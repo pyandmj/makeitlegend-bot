@@ -41,6 +41,11 @@ export const config = {
     websiteSecret: process.env.WEBSITE_WEBHOOK_SECRET || '',
   },
 
+  /** Google AI (Gemini) configuration */
+  googleAi: {
+    apiKey: process.env.GOOGLE_AI_API_KEY || '',
+  },
+
   /** Scheduling configuration */
   scheduling: {
     briefingCron: process.env.BRIEFING_CRON || '0 8 * * *',
