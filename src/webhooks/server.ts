@@ -40,6 +40,9 @@ const logger = createModuleLogger('webhook-server');
 export function createWebhookServer(approvalService: ApprovalService): express.Application {
   const app = express();
 
+  // Railway runs behind a reverse proxy — trust it for rate limiting
+  app.set('trust proxy', 1);
+
   // ─────────────────────────────────────────────────────
   // Middleware
   // ─────────────────────────────────────────────────────
@@ -52,6 +55,7 @@ export function createWebhookServer(approvalService: ApprovalService): express.A
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests' },
+    validate: { xForwardedForHeader: false },
   });
   app.use(limiter);
 
