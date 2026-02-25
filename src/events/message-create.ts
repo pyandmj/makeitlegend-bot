@@ -1,8 +1,9 @@
-import { Message, Attachment } from 'discord.js';
+import { Message, Attachment, MessageFlags } from 'discord.js';
 import { config } from '../config';
 import { createModuleLogger } from '../utils/logger';
 import { getChannelRouter, getManusClient } from '../services/service-registry';
 import https from 'https';
+import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -47,7 +48,6 @@ Current business context:
 
 /**
  * Sends a message to Manus AI and polls for the response.
- * Uses multi-turn conversation (continues existing task if available).
  */
 async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
   const manusClient = getManusClient();
@@ -56,16 +56,14 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
   }
 
   try {
-    // If we have an active task, continue the conversation
     if (activeManusTaskId) {
       logger.info(`Continuing Manus task ${activeManusTaskId} with new message`);
       const continueResult = await manusClient.continueTask(activeManusTaskId, userMessage);
       
       if (continueResult) {
-        // Poll for the response
         const taskDetail = await manusClient.pollTaskUntilDone(continueResult.task_id, {
           intervalMs: 3_000,
-          timeoutMs: 120_000, // 2 minutes max
+          timeoutMs: 120_000,
         });
 
         if (taskDetail) {
@@ -77,12 +75,10 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
         }
       }
       
-      // If continue failed, start a fresh task
       logger.warn('Continue task failed, starting fresh conversation');
       activeManusTaskId = null;
     }
 
-    // Start a new Manus task for Prime
     const enrichedPrompt = `${PRIME_CONTEXT}\n\n---\n\nThe Founder says: ${userMessage}`;
     
     const result = await manusClient.createTask({
@@ -105,7 +101,6 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
     const manusTaskId = result.taskResponse.task_id;
     logger.info(`Created Manus task for Prime: ${manusTaskId}`);
 
-    // Poll for the response
     const taskDetail = await manusClient.pollTaskUntilDone(manusTaskId, {
       intervalMs: 3_000,
       timeoutMs: 120_000,
@@ -133,28 +128,102 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
 
 /**
  * Downloads a file from a URL to a temporary path.
+ * Follows redirects (Discord CDN often redirects).
  */
-async function downloadFile(url: string, destPath: string): Promise<void> {
+async function downloadFile(url: string, destPath: string, maxRedirects = 5): Promise<void> {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    https.get(url, (response) => {
-      if (response.statusCode === 301 || response.statusCode === 302) {
-        const redirectUrl = response.headers.location;
-        if (redirectUrl) {
-          https.get(redirectUrl, (res) => {
-            res.pipe(file);
-            file.on('finish', () => { file.close(); resolve(); });
-          }).on('error', reject);
+    const doRequest = (currentUrl: string, redirectsLeft: number) => {
+      const client = currentUrl.startsWith('https') ? https : http;
+      
+      client.get(currentUrl, (response) => {
+        // Follow redirects
+        if ((response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 307 || response.statusCode === 308) && response.headers.location) {
+          if (redirectsLeft <= 0) {
+            reject(new Error('Too many redirects'));
+            return;
+          }
+          logger.info(`Following redirect to: ${response.headers.location}`);
+          doRequest(response.headers.location, redirectsLeft - 1);
           return;
         }
-      }
-      response.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', (err) => {
-      fs.unlink(destPath, () => {});
-      reject(err);
-    });
+
+        if (response.statusCode !== 200) {
+          reject(new Error(`Download failed with status ${response.statusCode}`));
+          return;
+        }
+
+        const file = fs.createWriteStream(destPath);
+        response.pipe(file);
+        file.on('finish', () => {
+          file.close();
+          resolve();
+        });
+        file.on('error', (err) => {
+          fs.unlink(destPath, () => {});
+          reject(err);
+        });
+      }).on('error', (err) => {
+        fs.unlink(destPath, () => {});
+        reject(err);
+      });
+    };
+
+    doRequest(url, maxRedirects);
   });
+}
+
+/**
+ * Detects if a message contains a voice memo.
+ * Discord voice messages have the IS_VOICE_MESSAGE flag (1 << 13 = 8192)
+ * and typically have an attachment named "voice-message.ogg".
+ */
+function findVoiceAttachment(message: Message): Attachment | null {
+  // Method 1: Check message flags for IS_VOICE_MESSAGE (bit 13)
+  const isVoiceMessage = message.flags?.has(MessageFlags.IsVoiceMessage ?? (1 << 13));
+  
+  if (isVoiceMessage) {
+    // Voice messages always have exactly one audio attachment
+    const att = message.attachments.first();
+    if (att) {
+      logger.info(`Detected voice message via flags: ${att.name} (${att.contentType}, ${att.size} bytes, url: ${att.url.substring(0, 80)}...)`);
+      return att;
+    }
+  }
+
+  // Method 2: Check for voice-message.ogg filename (Discord's default)
+  const voiceByName = message.attachments.find(
+    (att) => att.name === 'voice-message.ogg' || att.name?.startsWith('voice-message')
+  );
+  if (voiceByName) {
+    logger.info(`Detected voice message by filename: ${voiceByName.name} (${voiceByName.contentType}, ${voiceByName.size} bytes)`);
+    return voiceByName;
+  }
+
+  // Method 3: Check for waveform property (only present on voice messages)
+  const voiceByWaveform = message.attachments.find(
+    (att) => (att as any).waveform != null
+  );
+  if (voiceByWaveform) {
+    logger.info(`Detected voice message by waveform: ${voiceByWaveform.name} (${voiceByWaveform.contentType}, ${voiceByWaveform.size} bytes)`);
+    return voiceByWaveform;
+  }
+
+  // Method 4: Fallback — check content type and file extensions
+  const voiceByType = message.attachments.find(
+    (att) => att.contentType?.startsWith('audio/') || 
+             att.name?.endsWith('.ogg') || 
+             att.name?.endsWith('.mp3') || 
+             att.name?.endsWith('.wav') ||
+             att.name?.endsWith('.m4a') ||
+             att.name?.endsWith('.webm') ||
+             att.name?.endsWith('.opus')
+  );
+  if (voiceByType) {
+    logger.info(`Detected audio attachment by type/extension: ${voiceByType.name} (${voiceByType.contentType}, ${voiceByType.size} bytes)`);
+    return voiceByType;
+  }
+
+  return null;
 }
 
 /**
@@ -164,23 +233,39 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
 async function transcribeVoiceMemo(attachment: Attachment): Promise<string | null> {
   const apiKey = process.env.GOOGLE_AI_API_KEY;
   if (!apiKey) {
-    logger.warn('GOOGLE_AI_API_KEY not set — voice memo transcription unavailable');
+    logger.error('GOOGLE_AI_API_KEY not set — voice memo transcription unavailable');
     return null;
   }
 
+  // Determine file extension from attachment
+  let ext = path.extname(attachment.name || '').toLowerCase();
+  if (!ext) {
+    // Discord voice messages are always OGG Opus
+    ext = '.ogg';
+  }
+  
   const tmpDir = os.tmpdir();
-  const ext = path.extname(attachment.name || '.ogg') || '.ogg';
   const tmpPath = path.join(tmpDir, `voice_${Date.now()}${ext}`);
 
   try {
-    logger.info(`Downloading voice memo: ${attachment.name} (${attachment.size} bytes)`);
+    logger.info(`Downloading voice memo: name=${attachment.name}, contentType=${attachment.contentType}, size=${attachment.size}, url=${attachment.url.substring(0, 100)}`);
     await downloadFile(attachment.url, tmpPath);
+
+    // Verify file was downloaded
+    const stats = fs.statSync(tmpPath);
+    logger.info(`Downloaded file: ${stats.size} bytes at ${tmpPath}`);
+    
+    if (stats.size === 0) {
+      logger.error('Downloaded file is empty');
+      return null;
+    }
 
     // Read the audio file and convert to base64
     const audioBuffer = fs.readFileSync(tmpPath);
     const audioBase64 = audioBuffer.toString('base64');
 
     // Map file extension to MIME type
+    // Discord voice messages are OGG with Opus codec
     const mimeMap: Record<string, string> = {
       '.ogg': 'audio/ogg',
       '.mp3': 'audio/mp3',
@@ -189,9 +274,16 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
       '.webm': 'audio/webm',
       '.opus': 'audio/ogg',
     };
-    const mimeType = mimeMap[ext.toLowerCase()] || 'audio/ogg';
+    
+    // Use contentType from Discord if available, otherwise map from extension
+    let mimeType = attachment.contentType || mimeMap[ext] || 'audio/ogg';
+    
+    // Gemini might not recognize some content types — normalize
+    if (mimeType === 'audio/ogg; codecs=opus' || mimeType === 'audio/opus') {
+      mimeType = 'audio/ogg';
+    }
 
-    logger.info(`Transcribing voice memo with Gemini (${mimeType}, ${audioBuffer.length} bytes)...`);
+    logger.info(`Sending to Gemini for transcription: mimeType=${mimeType}, base64Length=${audioBase64.length}`);
 
     // Call Gemini API with audio inline data
     const requestBody = JSON.stringify({
@@ -228,28 +320,47 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
         },
       };
 
+      logger.info(`Making Gemini API request to ${urlObj.hostname}${urlObj.pathname} (body size: ${Buffer.byteLength(requestBody)} bytes)`);
+
       const req = https.request(options, (res) => {
         let data = '';
         res.on('data', (chunk) => { data += chunk; });
         res.on('end', () => {
+          logger.info(`Gemini API response status: ${res.statusCode}, body length: ${data.length}`);
+          
           try {
             const parsed = JSON.parse(data);
             
             if (parsed.error) {
-              logger.error('Gemini transcription API error', { error: parsed.error });
+              logger.error('Gemini transcription API error', { 
+                code: parsed.error.code,
+                message: parsed.error.message,
+                status: parsed.error.status,
+                details: JSON.stringify(parsed.error.details || []).substring(0, 500),
+              });
               resolve(null);
               return;
             }
 
             const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
             if (text) {
+              logger.info(`Gemini transcription successful: "${text.substring(0, 100)}..."`);
               resolve(text.trim());
             } else {
-              logger.error('No text in Gemini transcription response', { response: data.substring(0, 500) });
+              const blockReason = parsed.candidates?.[0]?.finishReason;
+              const promptFeedback = parsed.promptFeedback;
+              logger.error('No text in Gemini transcription response', { 
+                finishReason: blockReason,
+                promptFeedback: JSON.stringify(promptFeedback || {}),
+                response: data.substring(0, 1000),
+              });
               resolve(null);
             }
           } catch (e: any) {
-            logger.error('Failed to parse Gemini transcription response', { error: e?.message });
+            logger.error('Failed to parse Gemini transcription response', { 
+              error: e?.message,
+              responsePreview: data.substring(0, 500),
+            });
             resolve(null);
           }
         });
@@ -260,9 +371,9 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
         resolve(null);
       });
 
-      req.setTimeout(30000, () => {
+      req.setTimeout(60000, () => {
         req.destroy();
-        logger.error('Gemini transcription request timed out');
+        logger.error('Gemini transcription request timed out after 60s');
         resolve(null);
       });
 
@@ -270,13 +381,13 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
       req.end();
     });
 
-    if (transcription) {
-      logger.info(`Transcription complete: ${transcription.substring(0, 100)}...`);
-    }
     return transcription;
 
   } catch (error: any) {
-    logger.error('Failed to transcribe voice memo', { error: error?.message || error });
+    logger.error('Failed to transcribe voice memo', { 
+      error: error?.message || error,
+      stack: error?.stack,
+    });
     return null;
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
@@ -301,19 +412,19 @@ export async function handleMessageCreate(message: Message): Promise<void> {
   const founderId = config.discord.founderUserId;
   if (founderId && message.author.id !== founderId) return;
 
-  logger.info(`Founder message in #ceo-briefing: ${message.content || '[attachment]'}`);
+  // Log everything about the message for debugging
+  logger.info(`Founder message in #ceo-briefing: content="${message.content || ''}", attachments=${message.attachments.size}, flags=${message.flags?.bitfield}`);
+  
+  if (message.attachments.size > 0) {
+    message.attachments.forEach((att, id) => {
+      logger.info(`  Attachment: id=${id}, name=${att.name}, contentType=${att.contentType}, size=${att.size}, waveform=${(att as any).waveform ? 'yes' : 'no'}, url=${att.url.substring(0, 80)}`);
+    });
+  }
 
   let userText = message.content || '';
 
   // Check for voice memo attachments
-  const voiceAttachment = message.attachments.find(
-    (att) => att.contentType?.startsWith('audio/') || 
-             att.name?.endsWith('.ogg') || 
-             att.name?.endsWith('.mp3') || 
-             att.name?.endsWith('.wav') ||
-             att.name?.endsWith('.m4a') ||
-             att.name?.endsWith('.webm')
-  );
+  const voiceAttachment = findVoiceAttachment(message);
 
   if (voiceAttachment) {
     try { await (message.channel as any).sendTyping(); } catch {}
@@ -329,7 +440,7 @@ export async function handleMessageCreate(message: Message): Promise<void> {
     } else {
       const router = getChannelRouter();
       if (router) {
-        await router.sendAsAgent('ceo-briefing', 'manus-prime', "I couldn't transcribe that voice memo. Could you try sending it again or type it out?");
+        await router.sendAsAgent('ceo-briefing', 'manus-prime', "I couldn't transcribe that voice memo. Check the logs for details — it might be an API key issue or audio format problem. Could you try typing it out for now?");
       }
       return;
     }
