@@ -242,7 +242,7 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
 
     console.log(`[VOICE] Gemini response status: ${geminiResponse.status}`);
     
-    const geminiData = await geminiResponse.json();
+    const geminiData: any = await geminiResponse.json();
     
     if (geminiData.error) {
       console.error(`[VOICE] Gemini API error: ${geminiData.error.code} - ${geminiData.error.message}`);
