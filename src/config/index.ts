@@ -126,7 +126,7 @@ export const CHANNEL_STRUCTURE = {
  */
 export const ROLE_DEFINITIONS = [
   { name: 'Founder', color: 0xFFD700, hoist: true, mentionable: true, position: 'top', departments: ['all'] },
-  { name: 'Manus Prime', color: 0x9B59B6, hoist: true, mentionable: true, position: 'high', departments: ['all'] },
+  { name: 'Prime', color: 0x9B59B6, hoist: true, mentionable: true, position: 'high', departments: ['all'] },
   { name: 'Engineering Director', color: 0x3498DB, hoist: true, mentionable: true, position: 'mid', departments: ['ENGINEERING'] },
   { name: 'Creative Director', color: 0xE91E63, hoist: true, mentionable: true, position: 'mid', departments: ['CREATIVE'] },
   { name: 'Marketing Director', color: 0x2ECC71, hoist: true, mentionable: true, position: 'mid', departments: ['MARKETING'] },

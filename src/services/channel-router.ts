@@ -19,8 +19,8 @@ export interface AgentIdentity {
  */
 export const AGENT_IDENTITIES: Record<string, AgentIdentity> = {
   'manus-prime': {
-    name: 'Manus Prime',
-    role: 'CEO & Coordinator',
+    name: 'Prime',
+    role: 'AI Coordinator',
     avatarURL: 'https://files.manuscdn.com/user_upload_by_module/session_file/310519663358711383/OHaDPdydzpXpzLZc.png',
   },
   'alex': {

@@ -27,6 +27,7 @@ import {
   registerWasteDetector,
 } from './services/service-registry';
 import { handleInteractionCreate } from './events/interaction-create';
+import { handleMessageCreate } from './events/message-create';
 import { handleMessageReactionAdd, setApprovalService } from './events/message-reaction';
 import { createWebhookServer } from './webhooks/server';
 import { deployCommands } from './deploy-commands';
@@ -333,6 +334,7 @@ client.on(Events.GuildCreate, async (guild: Guild) => {
 
 client.on(Events.InteractionCreate, handleInteractionCreate);
 client.on(Events.MessageReactionAdd, handleMessageReactionAdd);
+client.on(Events.MessageCreate, handleMessageCreate);
 
 client.on(Events.Error, (error) => {
   logger.error('Discord client error', { error });
