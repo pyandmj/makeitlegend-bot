@@ -98,6 +98,36 @@ export function createWebhookServer(approvalService: ApprovalService): express.A
   });
 
   // ─────────────────────────────────────────────────────
+  // Internal API: Send message as agent identity
+  // ─────────────────────────────────────────────────────
+
+  app.post('/api/send-as-agent', async (req: Request, res: Response) => {
+    try {
+      const { agent, channel, message } = req.body;
+      if (!agent || !channel || !message) {
+        res.status(400).json({ error: 'Missing required fields: agent, channel, message' });
+        return;
+      }
+
+      const router = getChannelRouter();
+      if (!router) {
+        res.status(503).json({ error: 'Channel router not available' });
+        return;
+      }
+
+      const messageId = await router.sendAsAgent(channel as any, agent, message);
+      if (messageId) {
+        res.json({ status: 'ok', messageId });
+      } else {
+        res.status(500).json({ error: 'Failed to send message' });
+      }
+    } catch (error: any) {
+      logger.error('Internal API error: send-as-agent', { error });
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ─────────────────────────────────────────────────────
   // Stripe Webhooks
   // ─────────────────────────────────────────────────────
 
