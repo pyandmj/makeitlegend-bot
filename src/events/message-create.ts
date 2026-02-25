@@ -272,98 +272,127 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
  * Voice transcription uses Google Gemini API.
  */
 export async function handleMessageCreate(message: Message): Promise<void> {
-  // Ignore bot messages (including our own webhook messages)
-  if (message.author.bot) return;
-  
-  // Only respond in ceo-briefing channel
-  const channel = message.channel;
-  if (!('name' in channel) || (channel as any).name !== 'ceo-briefing') return;
+  try {
+    // DIAGNOSTIC: Log every single message event to confirm the handler fires
+    const channelName = ('name' in message.channel) ? (message.channel as any).name : `unknown(${message.channel.id})`;
+    console.log(`[MSG-EVENT] messageCreate fired: author=${message.author?.tag || message.author?.id || 'unknown'}, bot=${message.author?.bot}, channel=${channelName}, content="${(message.content || '').substring(0, 50)}", attachments=${message.attachments?.size || 0}, flags=${message.flags?.bitfield}`);
 
-  // Only respond to the Founder
-  const founderId = config.discord.founderUserId;
-  if (founderId && message.author.id !== founderId) return;
+    // Ignore bot messages (including our own webhook messages)
+    if (message.author.bot) return;
 
-  // Log everything about the message for debugging — use console.log to guarantee Railway visibility
-  console.log(`[PRIME] Founder message in #ceo-briefing: content="${message.content || ''}", attachments=${message.attachments.size}, flags=${message.flags?.bitfield}`);
-  
-  if (message.attachments.size > 0) {
-    message.attachments.forEach((att, id) => {
-      console.log(`[PRIME] Attachment: id=${id}, name=${att.name}, contentType=${att.contentType}, size=${att.size}, waveform=${(att as any).waveform ? 'yes' : 'no'}`);
-    });
-  }
+    // Only respond in ceo-briefing channel — resolve name robustly
+    const channel = message.channel;
+    let resolvedChannelName: string | null = null;
 
-  let userText = message.content || '';
-
-  // If the user is replying to a specific message, include that context
-  if (message.reference?.messageId) {
-    try {
-      const referencedMsg = await message.channel.messages.fetch(message.reference.messageId);
-      if (referencedMsg) {
-        const refAuthor = referencedMsg.author?.username || referencedMsg.author?.tag || 'someone';
-        const refContent = referencedMsg.content || '';
-        const embedTexts = referencedMsg.embeds?.map(e => [e.title, e.description, ...(e.fields?.map(f => `${f.name}: ${f.value}`) || [])].filter(Boolean).join('\n')).join('\n') || '';
-        const refText = refContent || embedTexts;
-        if (refText) {
-          userText = `[Replying to ${refAuthor}'s message: "${refText.substring(0, 1000)}"]\n\n${userText}`;
-          console.log(`[PRIME] Included reply context from ${refAuthor}: ${refText.substring(0, 100)}...`);
+    if ('name' in channel && typeof (channel as any).name === 'string') {
+      resolvedChannelName = (channel as any).name;
+    } else if (channel.id) {
+      // Channel might be partial — try to fetch it
+      try {
+        const fetched = await channel.fetch();
+        if (fetched && 'name' in fetched) {
+          resolvedChannelName = (fetched as any).name;
+          console.log(`[PRIME] Resolved partial channel ${channel.id} to #${resolvedChannelName}`);
         }
+      } catch (fetchErr: any) {
+        console.warn(`[PRIME] Could not fetch channel ${channel.id}: ${fetchErr?.message}`);
       }
-    } catch (err: any) {
-      console.warn(`[PRIME] Could not fetch referenced message: ${err?.message}`);
     }
-  }
 
-  // Check for voice memo attachments
-  const voiceAttachment = findVoiceAttachment(message);
+    if (resolvedChannelName !== 'ceo-briefing') return;
 
-  if (voiceAttachment) {
-    console.log(`[PRIME] Voice memo detected — starting transcription`);
-    try { await (message.channel as any).sendTyping(); } catch {}
-
-    const transcription = await transcribeVoiceMemo(voiceAttachment);
-    if (transcription) {
-      userText = transcription;
-      
-      const router = getChannelRouter();
-      if (router) {
-        await router.sendAsAgent('ceo-briefing', 'manus-prime', `Got your voice memo. Here's what I heard:\n\n"${transcription}"`);
-      }
-    } else {
-      console.error(`[PRIME] Voice transcription failed — returning error to user`);
-      const router = getChannelRouter();
-      if (router) {
-        await router.sendAsAgent('ceo-briefing', 'manus-prime', "I couldn't transcribe that voice memo. Check the logs for details — it might be an API key issue or audio format problem. Could you try typing it out for now?");
-      }
+    // Only respond to the Founder
+    const founderId = config.discord.founderUserId;
+    if (founderId && message.author.id !== founderId) {
+      console.log(`[PRIME] Ignoring message from non-founder ${message.author.tag} (${message.author.id}), expected ${founderId}`);
       return;
     }
-  }
 
-  if (!userText.trim()) return;
+    // Log everything about the message for debugging — use console.log to guarantee Railway visibility
+    console.log(`[PRIME] Founder message in #ceo-briefing: content="${message.content || ''}", attachments=${message.attachments.size}, flags=${message.flags?.bitfield}`);
 
-  // Show typing indicator — keep refreshing it since Manus takes time
-  const typingInterval = setInterval(async () => {
-    try { await (message.channel as any).sendTyping(); } catch {}
-  }, 5000);
-  try { await (message.channel as any).sendTyping(); } catch {}
-
-  try {
-    // Get Prime's response via Manus AI
-    const response = await getPrimeResponseViaManus(userText);
-
-    const router = getChannelRouter();
-    if (router) {
-      if (response.length <= 2000) {
-        await router.sendAsAgent('ceo-briefing', 'manus-prime', response);
-      } else {
-        const chunks = response.match(/[\s\S]{1,1900}/g) || [response];
-        for (const chunk of chunks) {
-          await router.sendAsAgent('ceo-briefing', 'manus-prime', chunk);
-        }
-      }
-    } else {
-      await message.reply(response);
+    if (message.attachments.size > 0) {
+      message.attachments.forEach((att, id) => {
+        console.log(`[PRIME] Attachment: id=${id}, name=${att.name}, contentType=${att.contentType}, size=${att.size}, waveform=${(att as any).waveform ? 'yes' : 'no'}`);
+      });
     }
-  } finally {
-    clearInterval(typingInterval);
+
+    let userText = message.content || '';
+
+    // If the user is replying to a specific message, include that context
+    if (message.reference?.messageId) {
+      try {
+        const referencedMsg = await message.channel.messages.fetch(message.reference.messageId);
+        if (referencedMsg) {
+          const refAuthor = referencedMsg.author?.username || referencedMsg.author?.tag || 'someone';
+          const refContent = referencedMsg.content || '';
+          const embedTexts = referencedMsg.embeds?.map(e => [e.title, e.description, ...(e.fields?.map(f => `${f.name}: ${f.value}`) || [])].filter(Boolean).join('\n')).join('\n') || '';
+          const refText = refContent || embedTexts;
+          if (refText) {
+            userText = `[Replying to ${refAuthor}'s message: "${refText.substring(0, 1000)}"]\n\n${userText}`;
+            console.log(`[PRIME] Included reply context from ${refAuthor}: ${refText.substring(0, 100)}...`);
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[PRIME] Could not fetch referenced message: ${err?.message}`);
+      }
+    }
+
+    // Check for voice memo attachments
+    const voiceAttachment = findVoiceAttachment(message);
+
+    if (voiceAttachment) {
+      console.log(`[PRIME] Voice memo detected — starting transcription`);
+      try { await (message.channel as any).sendTyping(); } catch {}
+
+      const transcription = await transcribeVoiceMemo(voiceAttachment);
+      if (transcription) {
+        userText = transcription;
+
+        const router = getChannelRouter();
+        if (router) {
+          await router.sendAsAgent('ceo-briefing', 'manus-prime', `Got your voice memo. Here's what I heard:\n\n"${transcription}"`);
+        }
+      } else {
+        console.error(`[PRIME] Voice transcription failed — returning error to user`);
+        const router = getChannelRouter();
+        if (router) {
+          await router.sendAsAgent('ceo-briefing', 'manus-prime', "I couldn't transcribe that voice memo. Check the logs for details — it might be an API key issue or audio format problem. Could you try typing it out for now?");
+        }
+        return;
+      }
+    }
+
+    if (!userText.trim()) return;
+
+    // Show typing indicator — keep refreshing it since Manus takes time
+    const typingInterval = setInterval(async () => {
+      try { await (message.channel as any).sendTyping(); } catch {}
+    }, 5000);
+    try { await (message.channel as any).sendTyping(); } catch {}
+
+    try {
+      // Get Prime's response via Manus AI
+      const response = await getPrimeResponseViaManus(userText);
+
+      const router = getChannelRouter();
+      if (router) {
+        if (response.length <= 2000) {
+          await router.sendAsAgent('ceo-briefing', 'manus-prime', response);
+        } else {
+          const chunks = response.match(/[\s\S]{1,1900}/g) || [response];
+          for (const chunk of chunks) {
+            await router.sendAsAgent('ceo-briefing', 'manus-prime', chunk);
+          }
+        }
+      } else {
+        await message.reply(response);
+      }
+    } finally {
+      clearInterval(typingInterval);
+    }
+  } catch (error: any) {
+    console.error(`[PRIME] Unhandled error in handleMessageCreate: ${error?.message || error}`);
+    console.error(`[PRIME] Stack: ${error?.stack}`);
   }
 }
