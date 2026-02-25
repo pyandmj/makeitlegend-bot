@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: makeitlegend-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: FOUNDER_USER_ID
+        sync: false
+      - key: MANUS_API_KEY
+        sync: false
+      - key: WEBHOOK_PORT
+        value: "3000"
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: MANUS_WEBHOOK_SECRET
+        sync: false
+      - key: WEBSITE_WEBHOOK_SECRET
+        sync: false
+      - key: BRIEFING_CRON
+        value: "0 8 * * *"
+      - key: TIMEZONE
+        value: "America/New_York"
+      - key: LOG_LEVEL
+        value: "info"
+      - key: NODE_ENV
+        value: "production"

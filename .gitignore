@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+*.log
+logs/
+data/
+.DS_Store
+INVITE_LINK.txt
+nohup.out
+bot_output.log
