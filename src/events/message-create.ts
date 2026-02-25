@@ -11,9 +11,8 @@ import os from 'os';
 
 const logger = createModuleLogger('event:message');
 
-// Conversation history for Prime (keeps last 20 messages for context)
+// Conversation history for Prime (unlimited — Gemini 3.1 Pro has 1M token context window)
 const conversationHistory: Array<{ role: string; parts: Array<{ text: string }> }> = [];
-const MAX_HISTORY = 20;
 
 // OpenAI client for Whisper transcription only
 let whisperClient: OpenAI | null = null;
@@ -74,11 +73,6 @@ async function callGemini(userMessage: string): Promise<string> {
 
   // Add user message to history
   conversationHistory.push({ role: 'user', parts: [{ text: userMessage }] });
-
-  // Trim history if too long
-  while (conversationHistory.length > MAX_HISTORY) {
-    conversationHistory.shift();
-  }
 
   const requestBody = JSON.stringify({
     system_instruction: {
