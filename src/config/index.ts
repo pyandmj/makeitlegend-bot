@@ -32,7 +32,7 @@ export const config = {
 
   /** Webhook server configuration */
   webhook: {
-    port: parseInt(process.env.WEBHOOK_PORT || '3000', 10),
+    port: parseInt(process.env.PORT || process.env.WEBHOOK_PORT || '3000', 10),
     publicUrl: process.env.WEBHOOK_PUBLIC_URL || process.env.RAILWAY_PUBLIC_DOMAIN
       ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
       : '',
