@@ -414,6 +414,26 @@ export async function handleMessageCreate(message: Message): Promise<void> {
 
   let userText = message.content || '';
 
+  // If the user is replying to a specific message, include that context
+  if (message.reference?.messageId) {
+    try {
+      const referencedMsg = await message.channel.messages.fetch(message.reference.messageId);
+      if (referencedMsg) {
+        const refAuthor = referencedMsg.author?.username || referencedMsg.author?.tag || 'someone';
+        const refContent = referencedMsg.content || '';
+        // Also grab embed text if the referenced message was an embed (bot messages)
+        const embedTexts = referencedMsg.embeds?.map(e => [e.title, e.description, ...(e.fields?.map(f => `${f.name}: ${f.value}`) || [])].filter(Boolean).join('\n')).join('\n') || '';
+        const refText = refContent || embedTexts;
+        if (refText) {
+          userText = `[Replying to ${refAuthor}'s message: "${refText.substring(0, 1000)}"]\n\n${userText}`;
+          logger.info(`Included reply context from ${refAuthor}: ${refText.substring(0, 100)}...`);
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`Could not fetch referenced message: ${err?.message}`);
+    }
+  }
+
   // Check for voice memo attachments
   const voiceAttachment = findVoiceAttachment(message);
 

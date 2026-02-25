@@ -220,8 +220,8 @@ async function setupGuild(guild: Guild): Promise<void> {
 
     await channelRouter.sendEmbed('announcements', welcomeEmbed);
 
-    // Send initial briefing
-    await briefingScheduler.sendDailyBriefing();
+    // Initial briefing removed — only send via scheduled cron or /briefing command
+    // await briefingScheduler.sendDailyBriefing();
 
     isSetupComplete = true;
     logger.info('Guild setup completed successfully!');
