@@ -4,15 +4,14 @@ import { createModuleLogger } from '../utils/logger';
 import { getChannelRouter, getManusClient } from '../services/service-registry';
 import OpenAI from 'openai';
 import https from 'https';
-import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
 const logger = createModuleLogger('event:message');
 
-// Conversation history for Prime (unlimited — Gemini 3.1 Pro has 1M token context window)
-const conversationHistory: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+// Track the active Manus task ID for multi-turn conversation continuity
+let activeManusTaskId: string | null = null;
 
 // OpenAI client for Whisper transcription only
 let whisperClient: OpenAI | null = null;
@@ -29,8 +28,8 @@ function getWhisperClient(): OpenAI | null {
   return whisperClient;
 }
 
-// Prime's system prompt
-const PRIME_SYSTEM_PROMPT = `You are Prime, the AI coordinator for Make It Legend — an AI pet portrait business. You are the brain of the operation, managing a team of AI directors:
+// Prime's system context — prepended to the first message in each Manus task
+const PRIME_CONTEXT = `You are Prime, the AI coordinator for Make It Legend — an AI pet portrait business. You are the brain of the operation, managing a team of AI directors:
 
 - Alex — Engineering Director (website, infrastructure, APIs)
 - Maya — Creative Director (portrait generation, UGC, content)
@@ -63,136 +62,89 @@ Current business context:
 - Discord bot runs on Railway at web-production-2dac0.up.railway.app`;
 
 /**
- * Calls Google Gemini 3.1 Pro API directly.
+ * Sends a message to Manus AI and polls for the response.
+ * Uses multi-turn conversation (continues existing task if available).
  */
-async function callGemini(userMessage: string): Promise<string> {
-  const apiKey = process.env.GOOGLE_AI_API_KEY;
-  if (!apiKey) {
-    return "My brain isn't connected yet. The Founder needs to add GOOGLE_AI_API_KEY to Railway environment variables.";
+async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
+  const manusClient = getManusClient();
+  if (!manusClient) {
+    return "My brain isn't connected — the Manus API key needs to be set up in Railway.";
   }
-
-  // Add user message to history
-  conversationHistory.push({ role: 'user', parts: [{ text: userMessage }] });
-
-  const requestBody = JSON.stringify({
-    system_instruction: {
-      parts: [{ text: PRIME_SYSTEM_PROMPT }]
-    },
-    contents: conversationHistory,
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 1500,
-    }
-  });
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=${apiKey}`;
-
-  return new Promise((resolve) => {
-    const urlObj = new URL(url);
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(requestBody),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          
-          if (parsed.error) {
-            logger.error('Gemini API error', { error: parsed.error });
-            // Try fallback model
-            conversationHistory.pop(); // Remove the user message we just added
-            return resolve(callGeminiFallback(userMessage));
-          }
-
-          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (text) {
-            conversationHistory.push({ role: 'model', parts: [{ text }] });
-            resolve(text);
-          } else {
-            logger.error('No text in Gemini response', { response: data.substring(0, 500) });
-            conversationHistory.pop();
-            resolve(callGeminiFallback(userMessage));
-          }
-        } catch (e: any) {
-          logger.error('Failed to parse Gemini response', { error: e?.message, data: data.substring(0, 500) });
-          conversationHistory.pop();
-          resolve(callGeminiFallback(userMessage));
-        }
-      });
-    });
-
-    req.on('error', (error) => {
-      logger.error('Gemini request failed', { error: error.message });
-      conversationHistory.pop();
-      resolve(callGeminiFallback(userMessage));
-    });
-
-    req.setTimeout(30000, () => {
-      req.destroy();
-      logger.error('Gemini request timed out');
-      conversationHistory.pop();
-      resolve(callGeminiFallback(userMessage));
-    });
-
-    req.write(requestBody);
-    req.end();
-  });
-}
-
-/**
- * Fallback to Gemini 2.5 Flash via Manus OpenAI-compatible API.
- */
-async function callGeminiFallback(userMessage: string): Promise<string> {
-  logger.info('Falling back to Gemini 2.5 Flash via OpenAI-compatible API');
-  
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return "Both my primary and fallback brains are offline. Need either GOOGLE_AI_API_KEY or OPENAI_API_KEY in Railway.";
-  }
-
-  const client = new OpenAI();
-  
-  // Convert history format for OpenAI
-  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-    { role: 'system', content: PRIME_SYSTEM_PROMPT },
-  ];
-  
-  for (const msg of conversationHistory) {
-    messages.push({
-      role: msg.role === 'model' ? 'assistant' : 'user',
-      content: msg.parts[0]?.text || '',
-    });
-  }
-  
-  // Add the current message
-  messages.push({ role: 'user', content: userMessage });
 
   try {
-    const response = await client.chat.completions.create({
-      model: 'gemini-2.5-flash',
-      messages,
-      max_tokens: 1500,
-      temperature: 0.7,
+    // If we have an active task, continue the conversation
+    if (activeManusTaskId) {
+      logger.info(`Continuing Manus task ${activeManusTaskId} with new message`);
+      const continueResult = await manusClient.continueTask(activeManusTaskId, userMessage);
+      
+      if (continueResult) {
+        // Poll for the response
+        const taskDetail = await manusClient.pollTaskUntilDone(continueResult.task_id, {
+          intervalMs: 3_000,
+          timeoutMs: 120_000, // 2 minutes max
+        });
+
+        if (taskDetail) {
+          const extracted = manusClient.extractTaskOutput(taskDetail);
+          if (extracted.text) {
+            // Update active task ID in case it changed
+            activeManusTaskId = continueResult.task_id;
+            return extracted.text;
+          }
+        }
+      }
+      
+      // If continue failed, start a fresh task
+      logger.warn('Continue task failed, starting fresh conversation');
+      activeManusTaskId = null;
+    }
+
+    // Start a new Manus task for Prime
+    const enrichedPrompt = `${PRIME_CONTEXT}\n\n---\n\nThe Founder says: ${userMessage}`;
+    
+    const result = await manusClient.createTask({
+      department: 'engineering', // Prime is cross-department but needs a department for routing
+      agent: 'prime',
+      operation: 'prime:conversation',
+      request: {
+        prompt: enrichedPrompt,
+        agentProfile: 'manus-1.6',
+        hideInTaskList: true,
+      },
+      estimatedCredits: 0.5,
     });
 
-    const reply = response.choices[0]?.message?.content || "Sorry, couldn't process that.";
+    if (!result.success || !result.taskResponse) {
+      logger.error('Failed to create Manus task for Prime', { error: result.error });
+      return "Something went wrong creating my task. Let me try again in a moment.";
+    }
+
+    const manusTaskId = result.taskResponse.task_id;
+    logger.info(`Created Manus task for Prime: ${manusTaskId}`);
+
+    // Poll for the response
+    const taskDetail = await manusClient.pollTaskUntilDone(manusTaskId, {
+      intervalMs: 3_000,
+      timeoutMs: 120_000, // 2 minutes max
+    });
+
+    if (!taskDetail) {
+      logger.warn(`Prime Manus task timed out: ${manusTaskId}`);
+      return "I'm still thinking on that one — took longer than expected. Try asking again?";
+    }
+
+    const extracted = manusClient.extractTaskOutput(taskDetail);
     
-    // Add to history in Gemini format
-    conversationHistory.push({ role: 'user', parts: [{ text: userMessage }] });
-    conversationHistory.push({ role: 'model', parts: [{ text: reply }] });
-    
-    return reply;
+    if (extracted.text) {
+      // Save the task ID for multi-turn continuation
+      activeManusTaskId = manusTaskId;
+      return extracted.text;
+    }
+
+    return "I processed your message but didn't get a clear response back. Could you rephrase?";
+
   } catch (error: any) {
-    logger.error('Fallback LLM also failed', { error: error?.message });
+    logger.error('Prime Manus response failed', { error: error?.message || error });
     return "Something went wrong on my end. Let me try again in a moment.";
   }
 }
@@ -257,6 +209,7 @@ async function transcribeVoiceMemo(attachment: Attachment): Promise<string | nul
 /**
  * Handles incoming messages in the ceo-briefing channel.
  * Prime responds to the Founder's messages (text and voice memos).
+ * Uses Manus AI as the brain — same as all other directors.
  */
 export async function handleMessageCreate(message: Message): Promise<void> {
   // Ignore bot messages (including our own webhook messages)
@@ -306,22 +259,30 @@ export async function handleMessageCreate(message: Message): Promise<void> {
 
   if (!userText.trim()) return;
 
+  // Show typing indicator — keep refreshing it since Manus takes time
+  const typingInterval = setInterval(async () => {
+    try { await (message.channel as any).sendTyping(); } catch {}
+  }, 5000);
   try { await (message.channel as any).sendTyping(); } catch {}
 
-  // Get Prime's response using Gemini 3.1 Pro
-  const response = await callGemini(userText);
+  try {
+    // Get Prime's response via Manus AI
+    const response = await getPrimeResponseViaManus(userText);
 
-  const router = getChannelRouter();
-  if (router) {
-    if (response.length <= 2000) {
-      await router.sendAsAgent('ceo-briefing', 'manus-prime', response);
-    } else {
-      const chunks = response.match(/[\s\S]{1,1900}/g) || [response];
-      for (const chunk of chunks) {
-        await router.sendAsAgent('ceo-briefing', 'manus-prime', chunk);
+    const router = getChannelRouter();
+    if (router) {
+      if (response.length <= 2000) {
+        await router.sendAsAgent('ceo-briefing', 'manus-prime', response);
+      } else {
+        const chunks = response.match(/[\s\S]{1,1900}/g) || [response];
+        for (const chunk of chunks) {
+          await router.sendAsAgent('ceo-briefing', 'manus-prime', chunk);
+        }
       }
+    } else {
+      await message.reply(response);
     }
-  } else {
-    await message.reply(response);
+  } finally {
+    clearInterval(typingInterval);
   }
 }
