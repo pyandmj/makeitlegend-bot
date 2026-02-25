@@ -184,6 +184,7 @@ const DEPARTMENT_CONTEXT: Record<string, string> = {
   marketing: `You are working as a marketing agent for Make It Legend (AI Pet Portraits). Focus on growth strategy, SEO, ad copy, campaign planning, and analytics insights. Provide data-driven recommendations.`,
   operations: `You are working as an operations agent for Make It Legend (AI Pet Portraits). Focus on customer support, order management, process optimization, and operational efficiency. Be thorough and customer-focused.`,
   analytics: `You are working as an analytics agent for Make It Legend (AI Pet Portraits). Focus on data analysis, metrics tracking, reporting, and actionable insights. Provide clear visualizations and recommendations.`,
+  prime: '', // Prime has its own context in the prompt — no department prefix needed
 };
 
 // ─────────────────────────────────────────────────────────

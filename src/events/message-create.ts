@@ -82,7 +82,7 @@ async function getPrimeResponseViaManus(userMessage: string): Promise<string> {
     const enrichedPrompt = `${PRIME_CONTEXT}\n\n---\n\nThe Founder says: ${userMessage}`;
     
     const result = await manusClient.createTask({
-      department: 'engineering',
+      department: 'prime',
       agent: 'prime',
       operation: 'prime:conversation',
       request: {
