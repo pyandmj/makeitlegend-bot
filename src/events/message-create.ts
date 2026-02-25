@@ -348,11 +348,7 @@ export async function handleMessageCreate(message: Message): Promise<void> {
       const transcription = await transcribeVoiceMemo(voiceAttachment);
       if (transcription) {
         userText = transcription;
-
-        const router = getChannelRouter();
-        if (router) {
-          await router.sendAsAgent('ceo-briefing', 'manus-prime', `Got your voice memo. Here's what I heard:\n\n"${transcription}"`);
-        }
+        console.log(`[PRIME] Voice transcription successful, passing to Manus: "${transcription.substring(0, 100)}"`);
       } else {
         console.error(`[PRIME] Voice transcription failed — returning error to user`);
         const router = getChannelRouter();
